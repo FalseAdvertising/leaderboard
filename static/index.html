@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Target Rush</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=Hanken+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #EDF0F8;
+    --panel: #FFFFFF;
+    --ink: #101936;
+    --muted: #56617F;
+    --line: #D5DBEC;
+    --cobalt: #2437E0;
+    --signal: #FFD23F;
+    --signal-ink: #3A2E00;
+    --good: #0E8F63;
+    --display: "Bricolage Grotesque", "Arial Narrow", system-ui, sans-serif;
+    --body: "Hanken Grotesk", system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { color-scheme: light; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 400 16px/1.5 var(--body); }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 22px clamp(16px, 3vw, 32px) 48px; }
+
+  header { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin-bottom: 22px; }
+  h1 { font: 800 clamp(34px, 5vw, 52px)/0.95 var(--display); letter-spacing: -0.02em; margin: 0; }
+  .sub { margin: 8px 0 0; color: var(--muted); max-width: 48ch; }
+  header a { color: var(--cobalt); font-weight: 600; text-underline-offset: 3px; }
+
+  .layout { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(300px, 1fr); gap: 24px; align-items: start; }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+
+  .who { margin-bottom: 14px; }
+  label { display: block; font-size: 14px; font-weight: 500; color: var(--muted); margin-bottom: 4px; }
+  input { font: inherit; width: min(280px, 100%); padding: 10px 12px; border: 1.5px solid var(--line); border-radius: 10px; background: #fff; color: var(--ink); }
+  input:focus-visible, .tab:focus-visible, header a:focus-visible { outline: 3px solid var(--cobalt); outline-offset: 2px; }
+
+  .arena { position: relative; height: clamp(360px, 58vh, 540px); background: var(--cobalt); border-radius: 22px; overflow: hidden; cursor: crosshair; touch-action: manipulation; user-select: none; -webkit-user-select: none; }
+  .hud { position: absolute; inset: 14px 20px auto; display: flex; justify-content: space-between; align-items: flex-start; color: #fff; pointer-events: none; }
+  .hud div { display: flex; flex-direction: column; }
+  .hud .mid { align-items: center; }
+  .hud .end { align-items: flex-end; }
+  .hud b { font: 800 clamp(28px, 5vw, 42px)/1 var(--display); font-variant-numeric: tabular-nums; }
+  .hud span { font-size: 13px; font-weight: 500; opacity: 0.8; }
+  .bar { position: absolute; left: 0; bottom: 0; width: 100%; height: 6px; background: var(--signal); transform-origin: left; transition: transform 0.1s linear; }
+
+  .target { position: absolute; padding: 0; border: 0; border-radius: 50%; background: var(--signal); cursor: crosshair; animation: pop 0.12s ease-out; }
+  .target::before { content: ""; position: absolute; inset: 27%; border-radius: 50%; background: var(--cobalt); }
+  .target::after { content: ""; position: absolute; inset: -7px; border-radius: 50%; border: 3px solid #fff; animation: ring var(--life) linear forwards; }
+  @keyframes pop { from { transform: scale(0.5); } to { transform: scale(1); } }
+  @keyframes ring { from { transform: scale(1); opacity: 1; } to { transform: scale(0.55); opacity: 0.4; } }
+  .pop { position: absolute; color: #fff; font: 800 22px var(--display); pointer-events: none; animation: rise 0.7s ease-out forwards; }
+  @keyframes rise { to { transform: translateY(-40px); opacity: 0; } }
+
+  .overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 24px; text-align: center; color: #fff; background: rgba(16, 25, 54, 0.58); cursor: default; }
+  .overlay[hidden] { display: none; }
+  .overlay h2 { margin: 0; font: 800 clamp(30px, 5vw, 46px)/1.05 var(--display); letter-spacing: -0.01em; }
+  .overlay p { margin: 0; max-width: 38ch; }
+  .ranks { list-style: none; margin: 4px 0 6px; padding: 0; display: grid; gap: 4px; font-weight: 500; }
+  .ranks strong { font: 800 22px var(--display); margin-left: 6px; }
+  .btn { font: 700 17px var(--body); padding: 12px 24px; border: 0; border-radius: 12px; background: var(--signal); color: var(--signal-ink); cursor: pointer; }
+  .btn:hover { filter: brightness(0.95); }
+  .btn:focus-visible { outline: 3px solid #fff; outline-offset: 3px; }
+  .howto { margin: 12px 2px 0; color: var(--muted); font-size: 15px; max-width: 70ch; }
+
+  .board { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 16px 16px 12px; }
+  .board-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .board h2 { margin: 0; font: 800 24px var(--display); }
+  .live { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #B9C0D6; }
+  .live.on .dot { background: var(--good); }
+  .tabs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; padding: 4px; margin-bottom: 8px; background: var(--bg); border-radius: 12px; }
+  .tab { padding: 8px; border: 0; border-radius: 9px; background: transparent; color: var(--muted); font: 600 15px var(--body); cursor: pointer; }
+  .tab[aria-selected="true"] { background: #fff; color: var(--ink); box-shadow: 0 0 0 1px var(--line); }
+  ol.rows { list-style: none; margin: 0; padding: 0; }
+  ol.rows li { display: grid; grid-template-columns: 2.2em 1fr auto; gap: 8px; align-items: baseline; padding: 9px 8px; border-bottom: 1px solid var(--line); border-radius: 8px; }
+  ol.rows li:last-child { border-bottom: 0; }
+  ol.rows li.empty { display: block; padding: 18px 8px; color: var(--muted); }
+  .rank { font: 800 17px var(--display); color: var(--muted); font-variant-numeric: tabular-nums; }
+  ol.rows li:first-child .rank { color: var(--cobalt); }
+  .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+  .pts { font: 800 19px var(--display); font-variant-numeric: tabular-nums; }
+  ol.rows li.me { background: #EEF1FF; }
+  ol.rows li.me .name { font-weight: 700; }
+  ol.rows li.flash { animation: flash 1.1s ease-out; }
+  @keyframes flash { from { background: var(--signal); } to { background: transparent; } }
+  .note { margin: 10px 4px 0; font-size: 13px; color: var(--muted); }
+
+  @media (prefers-reduced-motion: reduce) {
+    .target, .pop, ol.rows li.flash { animation: none; }
+    .target::after { animation: ring var(--life) linear forwards; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Target Rush</h1>
+      <p class="sub">Thirty seconds, one arena. Your score lands on the leaderboard the moment the round ends.</p>
+    </div>
+    <a href="/dashboard">Open the metrics dashboard</a>
+  </header>
+
+  <div class="layout">
+    <main>
+      <div class="who">
+        <label for="name">Your name</label>
+        <input id="name" maxlength="20" autocomplete="off" spellcheck="false" placeholder="2 to 20 letters, numbers, _ or -">
+      </div>
+
+      <section class="arena" id="arena" aria-label="Game arena">
+        <div class="hud" aria-hidden="true">
+          <div><b id="time">30</b><span>Time left</span></div>
+          <div class="mid"><b id="score">0</b><span>Score</span></div>
+          <div class="end"><b id="mult">x1</b><span>Multiplier</span></div>
+        </div>
+        <div class="bar" id="bar"></div>
+        <div class="overlay" id="overlay" aria-live="polite">
+          <h2 id="ov-title">Ready when you are</h2>
+          <p id="ov-text">Enter your name, then start the round.</p>
+          <ul class="ranks" id="ov-ranks"></ul>
+          <button class="btn" id="go" type="button">Start game</button>
+        </div>
+      </section>
+      <p class="howto">Click each target before its ring closes. Faster hits score more, and every three hits in a row raises your multiplier up to x5. A miss resets it.</p>
+    </main>
+
+    <aside class="board" aria-label="Leaderboard">
+      <div class="board-head">
+        <h2>Leaderboard</h2>
+        <span class="live" id="live"><span class="dot"></span><span id="live-text">Connecting</span></span>
+      </div>
+      <div class="tabs" role="tablist">
+        <button class="tab" role="tab" data-board="daily" aria-selected="true">Daily</button>
+        <button class="tab" role="tab" data-board="weekly" aria-selected="false">Weekly</button>
+        <button class="tab" role="tab" data-board="all" aria-selected="false">All-time</button>
+      </div>
+      <ol class="rows" id="rows" aria-live="polite"></ol>
+      <p class="note">Each player appears once with their best score. Daily resets at 00:00 UTC and weekly on Monday at 00:00 UTC.</p>
+    </aside>
+  </div>
+</div>
+
+<script>
+(() => {
+  const $ = (s) => document.querySelector(s);
+  const NAME_RE = /^[A-Za-z0-9_-]{2,20}$/;
+  const GAME_MS = 30000;
+  const EMPTY = {
+    daily: 'No scores yet today. Play a round to start the board.',
+    weekly: 'No scores this week yet. Play a round to start the board.',
+    all: 'No scores yet. Play a round to start the board.'
+  };
+  const LABEL = { daily: 'Daily', weekly: 'Weekly', all: 'All-time' };
+
+  let boards = { daily: [], weekly: [], all: [] };
+  let prevMaps = {};
+  let tab = 'daily';
+  let game = null;
+
+  /* ---------- leaderboard ---------- */
+  const toMap = (rows) => Object.fromEntries(rows.map((r) => [r.player, r.score]));
+
+  function render(before) {
+    const rows = boards[tab] || [];
+    const list = $('#rows');
+    const me = $('#name').value.trim();
+    list.replaceChildren();
+    if (!rows.length) {
+      const li = document.createElement('li');
+      li.className = 'empty';
+      li.textContent = EMPTY[tab];
+      list.appendChild(li);
+      return;
+    }
+    rows.forEach((row, i) => {
+      const li = document.createElement('li');
+      if (row.player === me) li.classList.add('me');
+      if (before && before[row.player] !== row.score) li.classList.add('flash');
+      const rank = document.createElement('span');
+      rank.className = 'rank';
+      rank.textContent = i + 1;
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = row.player;
+      const pts = document.createElement('span');
+      pts.className = 'pts';
+      pts.textContent = row.score.toLocaleString();
+      li.append(rank, name, pts);
+      list.appendChild(li);
+    });
+  }
+
+  function onBoards(data) {
+    const before = prevMaps[tab];
+    boards = data;
+    render(before);
+    for (const b of Object.keys(data)) prevMaps[b] = toMap(data[b]);
+  }
+
+  document.querySelectorAll('.tab').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      tab = btn.dataset.board;
+      document.querySelectorAll('.tab').forEach((t) => t.setAttribute('aria-selected', String(t === btn)));
+      render();
+    });
+  });
+  $('#name').addEventListener('input', () => render());
+
+  function setLive(on) {
+    $('#live').classList.toggle('on', on);
+    $('#live-text').textContent = on ? 'Live' : 'Reconnecting';
+  }
+
+  function connect() {
+    try {
+      const es = new EventSource('/stream');
+      es.addEventListener('boards', (ev) => { setLive(true); onBoards(JSON.parse(ev.data)); });
+      es.onopen = () => setLive(true);
+      es.onerror = () => setLive(false);        // EventSource retries on its own
+    } catch (e) {
+      setLive(false);                           // the game still works without live updates
+    }
+  }
+  fetch('/boards').then((r) => r.json()).then(onBoards).catch(() => {});
+  connect();
+
+  /* ---------- game ---------- */
+  const arena = $('#arena');
+  const overlay = $('#overlay');
+
+  function showOverlay(title, text, button, ranks) {
+    $('#ov-title').textContent = title;
+    $('#ov-text').textContent = text || '';
+    $('#ov-text').hidden = !text;
+    const ul = $('#ov-ranks');
+    ul.replaceChildren();
+    (ranks || []).forEach(([label, value]) => {
+      const li = document.createElement('li');
+      li.append(label);
+      const s = document.createElement('strong');
+      s.textContent = value;
+      li.appendChild(s);
+      ul.appendChild(li);
+    });
+    $('#go').hidden = !button;
+    $('#go').textContent = button || '';
+    overlay.hidden = false;
+    if (button) $('#go').focus({ preventScroll: true });
+  }
+
+  const errorText = (body, fallback) => (body && typeof body.detail === 'string' ? body.detail : fallback);
+  const multiplier = () => Math.min(1 + Math.floor(game.combo / 3), 5);
+
+  function updateHud() {
+    $('#score').textContent = game.score.toLocaleString();
+    $('#mult').textContent = 'x' + multiplier();
+  }
+
+  async function startGame() {
+    const name = $('#name').value.trim();
+    if (!NAME_RE.test(name)) {
+      showOverlay('Pick a name first', 'Use 2 to 20 letters, numbers, _ or -.', 'Start game');
+      $('#name').focus();                               // keep Start visible; type a name, then press it
+      return;
+    }
+    try { localStorage.setItem('tr_name', name); } catch (e) {}
+    $('#go').disabled = true;
+    let token;
+    try {
+      const res = await fetch('/game/start?player=' + encodeURIComponent(name), { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(errorText(body, 'The server could not start a round.'));
+      token = body.token;
+    } catch (e) {
+      $('#go').disabled = false;
+      showOverlay('Could not start the round', e.message, 'Try again');
+      return;
+    }
+    $('#go').disabled = false;
+    overlay.hidden = true;
+    game = { name, token, score: 0, combo: 0, hits: 0, over: false, target: null, startedAt: performance.now() };
+    $('#time').textContent = '30';
+    $('#bar').style.transform = 'scaleX(1)';
+    updateHud();
+    game.interval = setInterval(tick, 100);
+    game.next = setTimeout(spawn, 350);
+  }
+
+  function tick() {
+    if (!game) return;
+    const left = Math.max(0, GAME_MS - (performance.now() - game.startedAt));
+    $('#time').textContent = Math.ceil(left / 1000);
+    $('#bar').style.transform = 'scaleX(' + (left / GAME_MS) + ')';
+    if (left <= 0) endGame();
+  }
+
+  function spawn() {
+    if (!game || game.over) return;
+    const rect = arena.getBoundingClientRect();
+    const size = rect.width < 520 ? 60 : 72;
+    const top = 76;                                    // keep clear of the HUD
+    const x = Math.random() * (rect.width - size);
+    const y = top + Math.random() * (rect.height - size - top - 12);
+    const life = Math.max(650, 1500 - game.hits * 10); // targets get quicker as you go
+    const el = document.createElement('button');
+    el.type = 'button';
+    el.className = 'target';
+    el.setAttribute('aria-label', 'Target');
+    el.style.cssText = 'left:' + x + 'px;top:' + y + 'px;width:' + size + 'px;height:' + size + 'px;--life:' + life + 'ms';
+    const born = performance.now();
+    el.addEventListener('pointerdown', (ev) => { ev.preventDefault(); ev.stopPropagation(); hit(el, born, life); });
+    arena.appendChild(el);
+    game.target = el;
+    game.expire = setTimeout(() => miss(el), life);
+  }
+
+  function floatText(el, text) {
+    const s = document.createElement('span');
+    s.className = 'pop';
+    s.textContent = text;
+    s.style.left = el.style.left;
+    s.style.top = el.style.top;
+    arena.appendChild(s);
+    setTimeout(() => s.remove(), 700);
+  }
+
+  function hit(el, born, life) {
+    if (!game || game.over || game.target !== el) return;
+    clearTimeout(game.expire);
+    const fraction = Math.max(0, 1 - (performance.now() - born) / life);
+    const points = (10 + Math.round(10 * fraction)) * multiplier();
+    game.score += points;
+    game.combo += 1;
+    game.hits += 1;
+    floatText(el, '+' + points);
+    el.remove();
+    game.target = null;
+    updateHud();
+    game.next = setTimeout(spawn, 140);
+  }
+
+  function miss(el) {                                   // target ran out of time
+    if (!game || game.over || game.target !== el) return;
+    el.remove();
+    game.target = null;
+    game.combo = 0;
+    updateHud();
+    game.next = setTimeout(spawn, 140);
+  }
+
+  arena.addEventListener('pointerdown', (ev) => {       // click on empty arena
+    if (game && !game.over && ev.target === arena) { game.combo = 0; updateHud(); }
+  });
+
+  async function endGame() {
+    const g = game;
+    g.over = true;
+    clearInterval(g.interval);
+    clearTimeout(g.expire);
+    clearTimeout(g.next);
+    if (g.target) g.target.remove();
+    $('#time').textContent = '0';
+    $('#bar').style.transform = 'scaleX(0)';
+    showOverlay('Time is up', 'Saving your score...', null);
+    try {
+      const url = '/score?player=' + encodeURIComponent(g.name) + '&score=' + g.score + '&token=' + encodeURIComponent(g.token);
+      const res = await fetch(url, { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(errorText(body, 'The server rejected this score.'));
+      const ranks = ['daily', 'weekly', 'all']
+        .filter((b) => body.results && body.results[b])
+        .map((b) => [LABEL[b] + ' rank', '#' + body.results[b].rank]);
+      showOverlay('You scored ' + g.score.toLocaleString(),
+        ranks.length ? 'Saved. Here is where you stand:' : 'Saved. Rankings are catching up.',
+        'Play again', ranks);
+    } catch (e) {
+      showOverlay('You scored ' + g.score.toLocaleString(), 'Not saved: ' + e.message, 'Play again');
+    }
+    game = null;
+  }
+
+  $('#go').onclick = startGame;
+  $('#name').addEventListener('keydown', (ev) => { if (ev.key === 'Enter' && !game) startGame(); });
+  try { $('#name').value = localStorage.getItem('tr_name') || ''; } catch (e) {}
+  render();
+})();
+</script>
+</body>
+</html>

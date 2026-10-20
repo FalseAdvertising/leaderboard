@@ -2,3 +2,4 @@ fastapi
 uvicorn
 redis
 psycopg2-binary
+prometheus-client
