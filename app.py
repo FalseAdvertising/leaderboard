@@ -28,7 +28,7 @@ from psycopg2.pool import ThreadedConnectionPool
 
 # ---------------------------------------------------------------- config
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_PORT = int(os.getenv("CACHE_PORT", "6379"))   # not REDIS_PORT: Kubernetes injects that as "tcp://ip:port"
 PG_HOST = os.getenv("PG_HOST", "postgresql")
 PG_PORT = int(os.getenv("PG_PORT", "5432"))
 DB_POOL = int(os.getenv("DB_POOL", "15"))          # per pod; keep pods x pool < Postgres max_connections (100)
