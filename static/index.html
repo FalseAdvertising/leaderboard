@@ -77,12 +77,21 @@
   .tab { padding: 8px; border: 0; border-radius: 9px; background: transparent; color: var(--muted); font: 600 15px var(--body); cursor: pointer; }
   .tab[aria-selected="true"] { background: #fff; color: var(--ink); box-shadow: 0 0 0 1px var(--line); }
   ol.rows { list-style: none; margin: 0; padding: 0; }
-  ol.rows li { display: grid; grid-template-columns: 2.2em 1fr auto; gap: 8px; align-items: baseline; padding: 9px 8px; border-bottom: 1px solid var(--line); border-radius: 8px; }
+  ol.rows li { display: grid; grid-template-columns: 2.2em 1fr auto auto; gap: 8px; align-items: center; padding: 9px 8px; border-bottom: 1px solid var(--line); border-radius: 8px; }
   ol.rows li:last-child { border-bottom: 0; }
   ol.rows li.empty { display: block; padding: 18px 8px; color: var(--muted); }
   .rank { font: 800 17px var(--display); color: var(--muted); font-variant-numeric: tabular-nums; }
   ol.rows li:first-child .rank { color: var(--cobalt); }
   .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+  .name small { display: block; font-weight: 400; font-size: 12.5px; color: var(--muted); }
+  .mini { font: 600 14px var(--body); padding: 5px 11px; border: 1.5px solid var(--cobalt); border-radius: 9px; background: transparent; color: var(--cobalt); cursor: pointer; }
+  .mini:hover { background: #EEF1FF; }
+  .mini:focus-visible { outline: 3px solid var(--cobalt); outline-offset: 2px; }
+  .tries { margin: 6px 2px 0; font-size: 14px; color: var(--muted); }
+  .tries[hidden] { display: none; }
+  .replaybar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; padding: 8px 8px 8px 14px; background: #fff; border: 1px solid var(--line); border-radius: 12px; font-weight: 600; }
+  .replaybar[hidden] { display: none; }
+  .target.ghost { pointer-events: none; }
   .pts { font: 800 19px var(--display); font-variant-numeric: tabular-nums; }
   ol.rows li.me { background: #EEF1FF; }
   ol.rows li.me .name { font-weight: 700; }
@@ -111,6 +120,12 @@
       <div class="who">
         <label for="name">Your name</label>
         <input id="name" maxlength="20" autocomplete="off" spellcheck="false" placeholder="2 to 20 letters, numbers, _ or -">
+        <p class="tries" id="my-tries" hidden></p>
+      </div>
+
+      <div class="replaybar" id="replaybar" hidden>
+        <span id="rp-text"></span>
+        <button class="mini" id="rp-stop" type="button">Stop replay</button>
       </div>
 
       <section class="arena" id="arena" aria-label="Game arena">
@@ -141,7 +156,7 @@
         <button class="tab" role="tab" data-board="all" aria-selected="false">All-time</button>
       </div>
       <ol class="rows" id="rows" aria-live="polite"></ol>
-      <p class="note">Each player appears once with their best score. Daily resets at 00:00 UTC and weekly on Monday at 00:00 UTC.</p>
+      <p class="note">Each player appears once with their best score. Every round is recorded, so the number under a name is how many tries they have played, and Watch replays their best round on this board. Daily resets at 00:00 UTC and weekly on Monday at 00:00 UTC.</p>
     </aside>
   </div>
 </div>
@@ -187,11 +202,26 @@
       rank.textContent = i + 1;
       const name = document.createElement('span');
       name.className = 'name';
-      name.textContent = row.player;
+      name.append(row.player);
+      if (row.tries) {
+        const small = document.createElement('small');
+        small.textContent = row.tries + (row.tries === 1 ? ' try' : ' tries');
+        name.appendChild(small);
+      }
       const pts = document.createElement('span');
       pts.className = 'pts';
       pts.textContent = row.score.toLocaleString();
-      li.append(rank, name, pts);
+      const act = document.createElement('span');
+      if (row.tries) {
+        const watchBtn = document.createElement('button');
+        watchBtn.type = 'button';
+        watchBtn.className = 'mini';
+        watchBtn.textContent = 'Watch';
+        watchBtn.setAttribute('aria-label', 'Watch the best round of ' + row.player);
+        watchBtn.addEventListener('click', () => watch(row.player, tab));
+        act.appendChild(watchBtn);
+      }
+      li.append(rank, name, pts, act);
       list.appendChild(li);
     });
   }
@@ -262,7 +292,10 @@
     $('#mult').textContent = 'x' + multiplier();
   }
 
+  const nowT = () => Math.round(performance.now() - game.startedAt);   // whole milliseconds into the round
+
   async function startGame() {
+    stopReplay(true);
     const name = $('#name').value.trim();
     if (!NAME_RE.test(name)) {
       showOverlay('Pick a name first', 'Use 2 to 20 letters, numbers, _ or -.', 'Start game');
@@ -284,7 +317,7 @@
     }
     $('#go').disabled = false;
     overlay.hidden = true;
-    game = { name, token, score: 0, combo: 0, hits: 0, over: false, target: null, startedAt: performance.now() };
+    game = { name, token, score: 0, combo: 0, hits: 0, over: false, target: null, cur: null, events: [], startedAt: performance.now() };
     $('#time').textContent = '30';
     $('#bar').style.transform = 'scaleX(1)';
     updateHud();
@@ -300,21 +333,26 @@
     if (left <= 0) endGame();
   }
 
+  // Every round is recorded as a list of events so the server can replay it:
+  // s = a target appears, h = hit, e = it expires, m = click on the empty arena.
   function spawn() {
     if (!game || game.over) return;
     const rect = arena.getBoundingClientRect();
     const size = rect.width < 520 ? 60 : 72;
     const top = 76;                                    // keep clear of the HUD
-    const x = Math.random() * (rect.width - size);
-    const y = top + Math.random() * (rect.height - size - top - 12);
+    const fx = Math.random();
+    const fy = Math.random();
+    const x = fx * (rect.width - size);
+    const y = top + fy * (rect.height - size - top - 12);
     const life = Math.max(650, 1500 - game.hits * 10); // targets get quicker as you go
     const el = document.createElement('button');
     el.type = 'button';
     el.className = 'target';
     el.setAttribute('aria-label', 'Target');
     el.style.cssText = 'left:' + x + 'px;top:' + y + 'px;width:' + size + 'px;height:' + size + 'px;--life:' + life + 'ms';
-    const born = performance.now();
-    el.addEventListener('pointerdown', (ev) => { ev.preventDefault(); ev.stopPropagation(); hit(el, born, life); });
+    game.cur = { t: nowT(), life };
+    game.events.push({ k: 's', t: game.cur.t, x: +fx.toFixed(4), y: +fy.toFixed(4), life });
+    el.addEventListener('pointerdown', (ev) => { ev.preventDefault(); ev.stopPropagation(); hit(el); });
     arena.appendChild(el);
     game.target = el;
     game.expire = setTimeout(() => miss(el), life);
@@ -330,11 +368,14 @@
     setTimeout(() => s.remove(), 700);
   }
 
-  function hit(el, born, life) {
+  function hit(el) {
     if (!game || game.over || game.target !== el) return;
     clearTimeout(game.expire);
-    const fraction = Math.max(0, 1 - (performance.now() - born) / life);
+    const t = nowT();
+    // same whole-millisecond arithmetic as the server, so both sides get identical points
+    const fraction = Math.max(0, 1 - (t - game.cur.t) / game.cur.life);
     const points = (10 + Math.round(10 * fraction)) * multiplier();
+    game.events.push({ k: 'h', t });
     game.score += points;
     game.combo += 1;
     game.hits += 1;
@@ -347,6 +388,7 @@
 
   function miss(el) {                                   // target ran out of time
     if (!game || game.over || game.target !== el) return;
+    game.events.push({ k: 'e', t: nowT() });
     el.remove();
     game.target = null;
     game.combo = 0;
@@ -354,8 +396,12 @@
     game.next = setTimeout(spawn, 140);
   }
 
-  arena.addEventListener('pointerdown', (ev) => {       // click on empty arena
-    if (game && !game.over && ev.target === arena) { game.combo = 0; updateHud(); }
+  arena.addEventListener('pointerdown', (ev) => {       // click on empty arena resets the streak
+    if (game && !game.over && ev.target === arena && game.combo > 0) {
+      game.events.push({ k: 'm', t: nowT() });
+      game.combo = 0;
+      updateHud();
+    }
   });
 
   async function endGame() {
@@ -367,28 +413,135 @@
     if (g.target) g.target.remove();
     $('#time').textContent = '0';
     $('#bar').style.transform = 'scaleX(0)';
-    showOverlay('Time is up', 'Saving your score...', null);
+    showOverlay('Time is up', 'Saving your round...', null);
     try {
-      const url = '/score?player=' + encodeURIComponent(g.name) + '&score=' + g.score + '&token=' + encodeURIComponent(g.token);
-      const res = await fetch(url, { method: 'POST' });
+      // the server works out the score from the recorded events and rejects a round that does not add up
+      const url = '/score?player=' + encodeURIComponent(g.name) + '&token=' + encodeURIComponent(g.token);
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ v: 1, score: g.score, events: g.events })
+      });
       const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(errorText(body, 'The server rejected this score.'));
+      if (!res.ok) throw new Error(errorText(body, 'The server rejected this round.'));
       const ranks = ['daily', 'weekly', 'all']
         .filter((b) => body.results && body.results[b])
         .map((b) => [LABEL[b] + ' rank', '#' + body.results[b].rank]);
+      const saved = body.tries ? 'Saved as try ' + body.tries + '.' : 'Saved.';
       showOverlay('You scored ' + g.score.toLocaleString(),
-        ranks.length ? 'Saved. Here is where you stand:' : 'Saved. Rankings are catching up.',
+        ranks.length ? saved + ' Here is where you stand:' : saved + ' Rankings are catching up.',
         'Play again', ranks);
+      loadMyTries();
     } catch (e) {
       showOverlay('You scored ' + g.score.toLocaleString(), 'Not saved: ' + e.message, 'Play again');
     }
     game = null;
   }
 
+  /* ---------- your tries ---------- */
+  async function loadMyTries() {
+    const name = $('#name').value.trim();
+    const line = $('#my-tries');
+    if (!NAME_RE.test(name)) { line.hidden = true; return; }
+    try {
+      const res = await fetch('/api/player/' + encodeURIComponent(name));
+      const body = await res.json();
+      if (!res.ok || !body.tries) { line.hidden = true; return; }
+      line.textContent = 'You have played ' + body.tries + (body.tries === 1 ? ' round' : ' rounds') +
+        '. Your best is ' + body.best.toLocaleString() + '.';
+      line.hidden = false;
+    } catch (e) { line.hidden = true; }
+  }
+
+  /* ---------- replays ---------- */
+  let replay = null;
+
+  function stopReplay(quiet) {
+    if (!replay) return;
+    replay.timers.forEach(clearTimeout);
+    clearInterval(replay.tick);
+    if (replay.el) replay.el.remove();
+    replay = null;
+    $('#replaybar').hidden = true;
+    $('#time').textContent = '30';
+    $('#score').textContent = '0';
+    $('#mult').textContent = 'x1';
+    $('#bar').style.transform = 'scaleX(1)';
+    if (!quiet) showOverlay('Ready when you are', 'Enter your name, then start the round.', 'Start game');
+  }
+
+  async function watch(player, board) {
+    if (game) return;                                   // never interrupt a live round
+    stopReplay(true);
+    try {
+      const res = await fetch('/api/replay/' + encodeURIComponent(player) + '?board=' + board);
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(errorText(body, 'No replay is available.'));
+      startReplay(body);
+    } catch (e) {
+      showOverlay('Cannot play that replay', e.message, 'Start game');
+    }
+  }
+
+  function startReplay(data) {
+    overlay.hidden = true;
+    const rp = { timers: [], el: null, score: 0, combo: 0, t0: performance.now() };
+    replay = rp;
+    $('#rp-text').textContent = 'Watching ' + data.player + ', ' + data.score.toLocaleString() + ' points';
+    $('#replaybar').hidden = false;
+    $('#time').textContent = '30';
+    $('#score').textContent = '0';
+    $('#mult').textContent = 'x1';
+    $('#bar').style.transform = 'scaleX(1)';
+    rp.tick = setInterval(() => {
+      const left = Math.max(0, GAME_MS - (performance.now() - rp.t0));
+      $('#time').textContent = Math.ceil(left / 1000);
+      $('#bar').style.transform = 'scaleX(' + (left / GAME_MS) + ')';
+    }, 100);
+    data.events.forEach((ev) => rp.timers.push(setTimeout(() => replayStep(rp, ev), ev.t)));
+    rp.timers.push(setTimeout(() => finishReplay(rp, data), GAME_MS + 400));
+  }
+
+  function replayStep(rp, ev) {
+    if (replay !== rp) return;
+    if (ev.k === 's') {
+      const rect = arena.getBoundingClientRect();
+      const size = rect.width < 520 ? 60 : 72;
+      const top = 76;
+      const el = document.createElement('div');
+      el.className = 'target ghost';
+      el.style.cssText = 'left:' + (ev.x * (rect.width - size)) + 'px;top:' + (top + ev.y * (rect.height - size - top - 12)) +
+        'px;width:' + size + 'px;height:' + size + 'px;--life:' + ev.life + 'ms';
+      arena.appendChild(el);
+      rp.el = el;
+    } else if (ev.k === 'h') {
+      if (rp.el) { floatText(rp.el, '+' + ev.p); rp.el.remove(); rp.el = null; }
+      rp.score += ev.p;
+      rp.combo += 1;
+    } else if (ev.k === 'e') {
+      if (rp.el) { rp.el.remove(); rp.el = null; }
+      rp.combo = 0;
+    } else {
+      rp.combo = 0;
+    }
+    $('#score').textContent = rp.score.toLocaleString();
+    $('#mult').textContent = 'x' + Math.min(1 + Math.floor(rp.combo / 3), 5);
+  }
+
+  function finishReplay(rp, data) {
+    if (replay !== rp) return;
+    stopReplay(true);
+    showOverlay('Replay finished', data.player + ' scored ' + data.score.toLocaleString() + '.', 'Start game');
+  }
+
+  $('#rp-stop').addEventListener('click', () => stopReplay(false));
+  $('#name').addEventListener('change', loadMyTries);
+
   $('#go').onclick = startGame;
   $('#name').addEventListener('keydown', (ev) => { if (ev.key === 'Enter' && !game) startGame(); });
   try { $('#name').value = localStorage.getItem('tr_name') || ''; } catch (e) {}
   render();
+  loadMyTries();
 })();
 </script>
 </body>

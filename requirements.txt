@@ -3,3 +3,4 @@ uvicorn
 redis
 psycopg2-binary
 prometheus-client
+boto3

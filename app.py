@@ -8,9 +8,11 @@ cluster, not just one pod.
 """
 import asyncio
 import json
+import math
 import os
 import re
 import secrets
+import statistics
 import threading
 import time
 from bisect import bisect_left
@@ -19,9 +21,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import boto3
 import redis
 import redis.asyncio as aioredis
-from fastapi import FastAPI, Header, HTTPException, Request
+from botocore.config import Config
+from botocore.exceptions import ClientError
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from psycopg2.pool import ThreadedConnectionPool
@@ -38,6 +43,18 @@ LOADTEST_KEY = os.getenv("LOADTEST_KEY", "")       # empty = load-test bypass di
 MAX_SCORE = int(os.getenv("MAX_SCORE", "8000"))
 MIN_GAME_SECONDS = float(os.getenv("MIN_GAME_SECONDS", "28"))   # game lasts 30 s
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "20"))
+
+# Replay store: S3-compatible object storage (RustFS on OpenShift, S3 on AWS).
+# Without S3_KEY and S3_SECRET, replays fall back to a Postgres table.
+S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://replay-store:9000")
+S3_BUCKET = os.getenv("S3_BUCKET", "replays")
+S3_KEY = os.getenv("S3_KEY", "")
+S3_SECRET = os.getenv("S3_SECRET", "")
+STORE_MODE = "s3" if S3_KEY and S3_SECRET else "postgres"
+
+GAME_MS = 30000                                   # length of a round
+MIN_REACTION_MS = int(os.getenv("MIN_REACTION_MS", "150"))   # faster than this is not human
+MAX_EVENTS = 500
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{2,20}$")
 BOARDS = ("daily", "weekly", "all")
@@ -58,6 +75,8 @@ HTTP_LAT = Histogram("lb_http_request_seconds", "Request latency", ["path"],
 BOARD_READS = Counter("lb_board_reads_total", "Board reads by data source", ["source"])
 SCORES_SAVED = Counter("lb_scores_saved_total", "Scores accepted")
 SSE_CLIENTS = Gauge("lb_sse_clients", "Open live-update connections on this pod")
+REPLAYS_SAVED = Counter("lb_replays_saved_total", "Round replays stored")
+REJECTS = Counter("lb_replay_rejects_total", "Rounds refused by the replay checks", ["reason"])
 
 # ---------------------------------------------------------------- postgres
 pool = None
@@ -92,11 +111,241 @@ def init_db():
                 "score INT, created_at TIMESTAMP DEFAULT now())")
             run("CREATE INDEX IF NOT EXISTS idx_player ON scores(player)")
             run("CREATE INDEX IF NOT EXISTS idx_created ON scores(created_at)")
+            run("ALTER TABLE scores ADD COLUMN IF NOT EXISTS round_id TEXT")
+            run("CREATE TABLE IF NOT EXISTS replays (id SERIAL PRIMARY KEY, player TEXT NOT NULL, "
+                "round_id TEXT NOT NULL, ts_ms BIGINT NOT NULL, score INT NOT NULL, body JSONB NOT NULL)")
+            run("CREATE INDEX IF NOT EXISTS idx_replays_player ON replays(player, ts_ms)")
             return
         except Exception as exc:
             print(f"waiting for database: {exc}", flush=True)
             time.sleep(2)
     raise RuntimeError("database never became ready")
+
+
+# ---------------------------------------------------------------- replays
+# One JSON file per try, grouped by player:  replays/<player>/<time>_<score>_<round>.json
+# Counting a player's files therefore gives their number of tries.
+store_ready = STORE_MODE == "postgres"
+_stopping = False
+s3 = None
+
+
+def get_s3():
+    global s3
+    if s3 is None:
+        s3 = boto3.client(
+            "s3", endpoint_url=S3_ENDPOINT, aws_access_key_id=S3_KEY, aws_secret_access_key=S3_SECRET,
+            region_name="us-east-1",
+            config=Config(signature_version="s3v4", s3={"addressing_style": "path"},
+                          connect_timeout=2, read_timeout=5, retries={"max_attempts": 2}))
+    return s3
+
+
+def init_store():
+    """Create the bucket once the object store answers. Runs in the background."""
+    global store_ready
+    if STORE_MODE != "s3":
+        return
+    while not _stopping:
+        try:
+            client = get_s3()
+            try:
+                client.head_bucket(Bucket=S3_BUCKET)
+            except ClientError as exc:
+                if exc.response["Error"]["Code"] not in ("404", "NoSuchBucket", "NotFound"):
+                    raise
+                client.create_bucket(Bucket=S3_BUCKET)
+            store_ready = True
+            print("replay store ready", flush=True)
+            return
+        except Exception as exc:
+            print(f"waiting for replay store: {exc}", flush=True)
+            time.sleep(5)
+
+
+def store_put(player, rid, ts_ms, score, doc):
+    if STORE_MODE == "s3":
+        key = f"replays/{player}/{ts_ms:013d}_{score:05d}_{rid}.json"
+        get_s3().put_object(Bucket=S3_BUCKET, Key=key,
+                            Body=json.dumps(doc, separators=(",", ":")).encode(),
+                            ContentType="application/json")
+    else:
+        run("INSERT INTO replays(player, round_id, ts_ms, score, body) VALUES (%s, %s, %s, %s, %s)",
+            (player, rid, ts_ms, score, json.dumps(doc)))
+
+
+def _parse_key(key):
+    name = key.rsplit("/", 1)[-1]
+    if not name.endswith(".json"):
+        return None
+    parts = name[:-5].split("_")
+    if len(parts) != 3 or not (parts[0].isdigit() and parts[1].isdigit()):
+        return None
+    return {"t": int(parts[0]), "score": int(parts[1]), "id": parts[2], "key": key}
+
+
+def store_list(player):
+    """Every try this player has saved, oldest first."""
+    if STORE_MODE == "s3":
+        items = []
+        pages = get_s3().get_paginator("list_objects_v2").paginate(
+            Bucket=S3_BUCKET, Prefix=f"replays/{player}/")
+        for page in pages:
+            for obj in page.get("Contents", []):
+                item = _parse_key(obj["Key"])
+                if item:
+                    items.append(item)
+        return sorted(items, key=lambda i: (i["t"], i["id"]))
+    rows = run("SELECT round_id, ts_ms, score FROM replays WHERE player = %s ORDER BY ts_ms, round_id",
+               (player,), fetch=True)
+    return [{"t": int(t), "score": int(s), "id": rid} for rid, t, s in rows]
+
+
+def store_get(player, item):
+    if STORE_MODE == "s3":
+        return json.loads(get_s3().get_object(Bucket=S3_BUCKET, Key=item["key"])["Body"].read())
+    rows = run("SELECT body FROM replays WHERE player = %s AND round_id = %s",
+               (player, item["id"]), fetch=True)
+    if not rows:
+        raise KeyError(item["id"])
+    body = rows[0][0]
+    return body if isinstance(body, dict) else json.loads(body)
+
+
+def store_count_all():
+    """Tries for every player, counted from the stored files (or rows)."""
+    counts = {}
+    if STORE_MODE == "s3":
+        pages = get_s3().get_paginator("list_objects_v2").paginate(Bucket=S3_BUCKET, Prefix="replays/")
+        for page in pages:
+            for obj in page.get("Contents", []):
+                parts = obj["Key"].split("/")
+                if len(parts) == 3 and _parse_key(obj["Key"]):
+                    counts[parts[1]] = counts.get(parts[1], 0) + 1
+        return counts
+    for player, n in run("SELECT player, COUNT(*) FROM replays GROUP BY player", fetch=True):
+        counts[player] = int(n)
+    return counts
+
+
+def ensure_tries():
+    """Tries per player sit in a Redis hash, rebuilt from the stored replays if it is lost."""
+    if r.exists("tries") or r.get("built:tries"):
+        return
+    if r.get("tries:skip"):
+        raise RuntimeError("replay store recently unavailable")
+    try:
+        counts = store_count_all()
+    except Exception:
+        r.set("tries:skip", 1, ex=30)
+        raise
+    if counts:
+        r.hset("tries", mapping=counts)
+    r.set("built:tries", 1)
+
+
+def attach_tries(boards_out):
+    names = sorted({row["player"] for rows in boards_out.values() for row in rows})
+    tmap = {}
+    if names:
+        try:
+            ensure_tries()
+            tmap = {n: int(v) for n, v in zip(names, r.hmget("tries", names)) if v}
+        except Exception:
+            pass
+    for rows in boards_out.values():
+        for row in rows:
+            row["tries"] = tmap.get(row["player"], 0)
+
+
+# ---- replay verification: the server replays the events through the game rules ----
+def reject(reason, message):
+    REJECTS.labels(reason).inc()
+    raise HTTPException(400, message)
+
+
+def verify_replay(body, elapsed_ms):
+    """Re-run a round from its recorded events and return (score, events, stats).
+
+    The client's own score is never trusted: it must match what these rules produce.
+    Event kinds: s = a target appears, h = it is hit, e = it expires, m = click on empty arena.
+    """
+    if not isinstance(body, dict) or body.get("v") != 1 or not isinstance(body.get("events"), list):
+        reject("format", "The replay is missing or in the wrong format")
+    events = body["events"]
+    if not 1 <= len(events) <= MAX_EVENTS:
+        reject("format", "The replay has too few or too many events")
+
+    score = hits = combo = 0
+    active = None                     # (spawn time, life) of the target on screen
+    last_t = 0
+    last_resolve = None
+    reactions, out = [], []
+    for ev in events:
+        if not isinstance(ev, dict):
+            reject("format", "The replay is in the wrong format")
+        kind, t = ev.get("k"), ev.get("t")
+        if kind not in ("s", "h", "e", "m") or not isinstance(t, int) or isinstance(t, bool):
+            reject("format", "The replay is in the wrong format")
+        if t < last_t or t > GAME_MS + 500:
+            reject("timing", "The replay timeline is out of order or longer than a round")
+        last_t = t
+
+        if kind == "s":
+            if active:
+                reject("rules", "A target appeared while another was still on screen")
+            life, x, y = ev.get("life"), ev.get("x"), ev.get("y")
+            if life != max(650, 1500 - hits * 10):
+                reject("rules", "Target timing does not follow the game rules")
+            if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 1 for v in (x, y)):
+                reject("format", "A target position is out of range")
+            earliest = 340 if last_resolve is None else last_resolve + 140 - 20
+            if t < earliest:
+                reject("timing", "Targets appeared faster than the game allows")
+            active = (t, life)
+            out.append({"k": "s", "t": t, "x": round(float(x), 4), "y": round(float(y), 4), "life": life})
+        elif kind == "h":
+            if not active:
+                reject("rules", "A hit was recorded with no target on screen")
+            spawn, life = active
+            dt = t - spawn
+            if dt < MIN_REACTION_MS:
+                reject("reaction", "A reaction time was faster than a human can manage")
+            if dt > life + 30:
+                reject("timing", "A hit was recorded after its target had expired")
+            fraction = max(0.0, 1 - dt / life)
+            multiplier = min(1 + combo // 3, 5)
+            points = (10 + math.floor(10 * fraction + 0.5)) * multiplier
+            score += points
+            combo += 1
+            hits += 1
+            reactions.append(dt)
+            active, last_resolve = None, t
+            out.append({"k": "h", "t": t, "p": points})
+        elif kind == "e":
+            if not active:
+                reject("rules", "An expiry was recorded with no target on screen")
+            spawn, life = active
+            if t < spawn + life - 20:
+                reject("timing", "A target expired earlier than the game allows")
+            combo = 0
+            active, last_resolve = None, t
+            out.append({"k": "e", "t": t})
+        else:                                           # "m": clicked the empty arena
+            combo = 0
+            out.append({"k": "m", "t": t})
+
+    if last_t > elapsed_ms + 750:
+        reject("timing", "The replay covers more time than the round actually took")
+    if hits >= 12 and statistics.pstdev(reactions) < 10:
+        reject("regular", "The reaction times are too regular to be human")
+    if body.get("score") != score:
+        reject("score_mismatch", "The score does not match the replay")
+    if score > MAX_SCORE:
+        reject("rules", f"Score must be between 0 and {MAX_SCORE}")
+    stats = {"hits": hits, "misses": sum(1 for e in out if e["k"] in ("e", "m")),
+             "avg_reaction_ms": round(statistics.mean(reactions)) if reactions else None}
+    return score, out, stats
 
 
 # ---------------------------------------------------------------- boards
@@ -165,6 +414,7 @@ def get_boards(nocache=False):
         out[b] = rows
         if _RANK[src] > _RANK[worst]:
             worst = src
+    attach_tries(out)                  # how many tries (stored replays) each player has
     return out, worst
 
 
@@ -221,10 +471,14 @@ def percentile(counts, q):
 # ---------------------------------------------------------------- app
 @asynccontextmanager
 async def lifespan(app):
+    global _stopping
     await asyncio.to_thread(init_db)
-    task = asyncio.create_task(heartbeat())
+    store_task = asyncio.create_task(asyncio.to_thread(init_store))   # never blocks start-up
+    beat = asyncio.create_task(heartbeat())
     yield
-    task.cancel()
+    _stopping = True
+    beat.cancel()
+    store_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -263,7 +517,7 @@ def dashboard():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "pod": POD}
+    return {"status": "ok", "pod": POD, "replay_store": STORE_MODE, "replay_store_ready": store_ready}
 
 
 # ---- game + security -------------------------------------------------------
@@ -296,8 +550,10 @@ def verify_token(player, token):
     owner, started = val.split("|")
     if owner != player:
         raise HTTPException(403, "Game token belongs to another player")
-    if time.time() - float(started) < MIN_GAME_SECONDS:
+    elapsed = time.time() - float(started)
+    if elapsed < MIN_GAME_SECONDS:
         raise HTTPException(403, "Score submitted before the game could have finished")
+    return elapsed * 1000
 
 
 def check_rate_limit(player):
@@ -313,23 +569,52 @@ def check_rate_limit(player):
 
 
 @app.post("/score")
-def submit(player: str, score: int, token: Optional[str] = None,
-           x_load_test_key: Optional[str] = Header(None)):
+def submit(player: str, score: Optional[int] = None, token: Optional[str] = None,
+           replay: Optional[dict] = Body(None), x_load_test_key: Optional[str] = Header(None)):
     check_name(player)
-    if not 0 <= score <= MAX_SCORE:
-        raise HTTPException(400, f"Score must be between 0 and {MAX_SCORE}")
     trusted = bool(LOADTEST_KEY) and secrets.compare_digest(
         (x_load_test_key or "").encode(), LOADTEST_KEY.encode())
-    if not trusted:                    # real players: rate limit + single-use game token
-        check_rate_limit(player)
-        verify_token(player, token)
+    now = datetime.now(timezone.utc)
+    ts_ms, ts = int(now.timestamp() * 1000), now.replace(tzinfo=None)
+    round_id = None
 
-    # 1. durable write first
-    ts = datetime.now(timezone.utc).replace(tzinfo=None)
-    run("INSERT INTO scores(player, score, created_at) VALUES (%s, %s, %s)", (player, score, ts))
+    if trusted:                        # our own load-test scripts: no game is played, so no replay
+        if score is None or not 0 <= score <= MAX_SCORE:
+            raise HTTPException(400, f"Score must be between 0 and {MAX_SCORE}")
+    else:                              # real players: rate limit, token, then the replay decides the score
+        check_rate_limit(player)
+        elapsed_ms = verify_token(player, token)
+        if replay is None:
+            reject("no_replay", "A replay of the round is required with every score")
+        score, events, stats = verify_replay(replay, elapsed_ms)
+        if not store_ready:
+            raise HTTPException(503, "Replay storage is starting, try again in a moment")
+        round_id = secrets.token_hex(6)
+        doc = {"v": 1, "round_id": round_id, "player": player, "score": score,
+               "saved_at": now.isoformat().replace("+00:00", "Z"), "stats": stats, "events": events}
+        try:
+            store_put(player, round_id, ts_ms, score, doc)     # the replay is saved before the score
+        except Exception:
+            raise HTTPException(503, "Replay storage is unavailable, so this round was not saved")
+        REPLAYS_SAVED.inc()
+
+    # 1. durable write
+    run("INSERT INTO scores(player, score, created_at, round_id) VALUES (%s, %s, %s, %s)",
+        (player, score, ts, round_id))
     SCORES_SAVED.inc()
 
-    # 2. update the boards and tell every open browser
+    # 2. how many tries this player has, counted from their stored replays.
+    #    This must be updated before the boards are published, or viewers get a stale count.
+    tries = None
+    if round_id:
+        try:
+            tries = len(store_list(player))
+            ensure_tries()
+            r.hset("tries", player, tries)
+        except Exception:
+            pass
+
+    # 3. update the boards and tell every open browser
     results = {}
     try:
         specs = [board_spec(b) for b in BOARDS]
@@ -352,7 +637,8 @@ def submit(player: str, score: int, token: Optional[str] = None,
                 results[b] = {"rank": rank + 1, "best": int(best)}
     except redis.RedisError:
         pass                           # score is safe in Postgres; boards rebuild on next read
-    return {"ok": True, "results": results}
+
+    return {"ok": True, "score": score, "round_id": round_id, "tries": tries, "results": results}
 
 
 # ---- reading boards --------------------------------------------------------
@@ -418,6 +704,59 @@ async def stream(request: Request):
 
     return StreamingResponse(events(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ---- tries and replays ------------------------------------------------------
+@app.get("/api/player/{player}")
+def api_player(player: str, limit: int = 20):
+    """One player's tries, counted from their stored replay files."""
+    check_name(player)
+    try:
+        items = store_list(player)
+    except Exception:
+        raise HTTPException(503, "Replay storage is unavailable")
+    recent = sorted(items, key=lambda i: i["t"], reverse=True)[:max(1, min(limit, 100))]
+    return {"player": player, "tries": len(items),
+            "best": max((i["score"] for i in items), default=None),
+            "rounds": [{"id": i["id"], "time": i["t"], "score": i["score"]} for i in recent]}
+
+
+@app.get("/api/tries")
+def api_tries(limit: int = 100):
+    """Number of tries for every player, most active first."""
+    try:
+        ensure_tries()
+        counts = {p: int(n) for p, n in r.hgetall("tries").items()}
+    except Exception:
+        try:
+            counts = store_count_all()
+        except Exception:
+            raise HTTPException(503, "Replay storage is unavailable")
+    rows = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:max(1, min(limit, 500))]
+    return [{"player": p, "tries": n} for p, n in rows]
+
+
+@app.get("/api/replay/{player}")
+def api_replay(player: str, board: str = "all", round_id: Optional[str] = Query(None, alias="round")):
+    """A player's best round on a board (or one specific round) as stored."""
+    check_name(player)
+    _, since, _ = board_spec(board)
+    since_ms = int(since.replace(tzinfo=timezone.utc).timestamp() * 1000)
+    try:
+        items = store_list(player)
+    except Exception:
+        raise HTTPException(503, "Replay storage is unavailable")
+    if round_id:
+        pool = [i for i in items if i["id"] == round_id]
+    else:
+        pool = [i for i in items if i["t"] >= since_ms]
+    if not pool:
+        raise HTTPException(404, "No replay for this player on this board yet")
+    pick = max(pool, key=lambda i: (i["score"], -i["t"]))
+    try:
+        return store_get(player, pick)
+    except Exception:
+        raise HTTPException(404, "That replay could not be read")
 
 
 # ---- metrics ---------------------------------------------------------------
